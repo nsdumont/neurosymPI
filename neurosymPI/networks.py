@@ -1,9 +1,18 @@
 import nengo
 import numpy as np
 
+#################################
+#  Nengo networks used in paper #
+#################################
 
+
+######################################################################
+#  A network that represents an HexSSP (given as input) with grid cells #
+#######################################################################
+# As input it needs an SSPSpace class object and 'n_neurons', the number of neurons to use in the network
 class SSPNetwork(nengo.network.Network):
     def __init__(self, ssp_space, n_neurons, **kwargs):
+        # Input with initializing: ssp_space
         super().__init__()
         d = ssp_space.ssp_dim
         G_encoders = ssp_space.sample_grid_encoders(n_neurons).T
@@ -13,13 +22,64 @@ class SSPNetwork(nengo.network.Network):
             nengo.Connection(self.input, self.ssp)
 
 
+###################################
+#  The path integration network  #
+###################################
+# High level: given only velocity information over time (and, optionally, an initial SSP for starting position), represent the SSP 
+#       estimation of current position over time, computed via recurrent connections in a spiking neural network
+# Some details: This creates an EnsembleArray (a set of indpendent neural populations). Each of the populations is a VCO that encodes the 
+#       real & imag values of one componet of the SSP in the Fourier domain, along with the freq at which these componets are oscillating in 
+#       the Fourier domain.
+#       Each population is recurrently connected to itself with weights set to approx the dynamics described in the paper
+# Input:
+#   ssp_space: a SSPSpace class object
+#   recurrent_tau: the post-synatipic time constant used in the connections that implement the dyanmical system (suggested values: 0.01-0.1)
+#   n_neurons: the number of neurons used in each population within the EnsembleArray
+#   scaling_factor (default=1): for scaling the velocity input
+#   stable (default=True): whether or not to use nonlinear attractor dynamics. A function can be passed instead of a boolean if you wish to define your own dynamics
+# Ouput:
+#   A nengo Network object that can be embedded inside other networks
+# Use:
+#   Create a nengo Network and define this inside the model. Provide input to the 'velocity_input' node and 'input' node, read out the position estimate 
+#   from 'output'
+#  Exmaple (se scripts in 'experiments' folder for complete examples):
+#   model = nengo.Network()
+#     with model:
+#         # Create inputs
+#         vel_input = nengo.Node( **insert some function that return velocity over time** , size_out=n)
+#         stim = nengo.Node(lambda t: **insert initial SSP** if t<0.1 else np.zeros((d,))) #IMPORTANT: only provide this initial SSP for a short time at the begining
+#
+#         #Create PI model
+#         pathintegrator = PathIntegration(ssp_space, tau, n_neurons, 
+#                                           scaling_factor=1, stable=True)
+#
+#         # Connect inputs to model
+#         nengo.Connection(vel_input,pathintegrator.velocity_input, synapse=None)
+#         nengo.Connection(stim,pathintegrator.input, synapse=None)
+#         
+#         # Read out the model's output
+#         ssp_p  = nengo.Probe(pathintegrator.output, synapse=None)
+#
+#   # Run the model for T seconds
+#   sim = nengo.Simulator(model,dt=simdt)
+#   sim.run(T)
+#
+#   # Now we have sim.data[ssp_p], a nt by d matrix with the position estimates (represented as d-dim SSPs) over the simulation (with nt sim timesteps)
+#   # To decode the position estimates in X space:
+#   sim_path, _ = ssp_space.decode_path(sim.data[ssp_p])
+#
+#   plt.plot(sim_path[:,0],sim_path[:,1])
 
 class PathIntegration(nengo.network.Network):
     def __init__(self, ssp_space, recurrent_tau, n_neurons,
                  scaling_factor=1, stable=True, **kwargs):
         super().__init__(**kwargs)
         
+        # Defining the dyanmical system to approximate via the recurrent connections
+        # NOTE: the network does not just use this function exactly while running,
+        #       this function is just used to train the recurrent connection weights before the simulation
         if stable==True:
+           # Attractor version of dynamics
             def feedback(x):
                 w = (x[0]/scaling_factor)/ssp_space.length_scale[0] ###!!!
                 r = np.maximum(np.sqrt(x[1]**2 + x[2]**2), 1e-8)
@@ -27,8 +87,10 @@ class PathIntegration(nengo.network.Network):
                 dx2 = x[2]*(1-r**2)/r + x[1]*w 
                 return recurrent_tau*dx1 + x[1], recurrent_tau*dx2 + x[2]
         elif callable(stable):
+            # User-defined dynamics
             feedback = stable
         else:
+            # Non-attractor (i.e. just a simple harmonic osc) version of dynamics
             def feedback(x): 
                 w = (x[0]/scaling_factor)/ssp_space.length_scale[0]
                 dx1 = - x[2]*w
@@ -52,31 +114,46 @@ class PathIntegration(nengo.network.Network):
         to_SSP = _get_to_SSP_mat(d)
         from_SSP = _get_from_SSP_mat(d)
         with self:
+            # Velocity input should be passed to this node
             self.velocity_input = nengo.Node(label="velocity_input", size_in=N)
+            # SSP representing starting postion (or corrections, if you'd like) can be passed to this node
             self.input = nengo.Node(label="input", size_in=d)
             
+            # A neural pop representing the velocity
             self.velocity = nengo.Ensemble(n_neurons, dimensions=N,label='velocity')
             nengo.Connection(self.velocity_input, self.velocity)
             
+            # The set of VCOs representing the SSP in the Fourier domain
             self.oscillators = nengo.networks.EnsembleArray(n_neurons, n_oscs + 1, 
                                                             ens_dimensions = 3,
                                                             radius=np.sqrt(2), label="oscillators")
             self.oscillators.output.output = lambda t, x: x
+            
             nengo.Connection(self.input,self.oscillators.input, transform=from_SSP, synapse=None)
+            
             for i in np.arange(n_oscs):
+                
+                # Dot product of velocity & ith row of phase matrix A is the frequency of VCO. The VCO pop gets this as input 
                 nengo.Connection(self.velocity, self.oscillators.ea_ensembles[i][0], 
                                  transform = reordered_phases[i,:].reshape(1,-1), synapse=recurrent_tau)
+                
+                # The VCO pop is recurrently connnected to implement the VCO dynamics 
                 nengo.Connection(self.oscillators.ea_ensembles[i], self.oscillators.ea_ensembles[i][1:], 
                                  function=feedback, 
                                  synapse=recurrent_tau)
+                
             zerofreq = nengo.Node([1,0,0])
             nengo.Connection(zerofreq, self.oscillators.ea_ensembles[-1])
             
             self.output = nengo.Node(size_in=d)
             nengo.Connection(self.oscillators.output[S_ids], self.output, 
                              transform = to_SSP/0.97, synapse=0.05)
-            
+   
 
+
+###################################
+#  The gated memory network  #
+###################################
 class InputGatedMemory(nengo.Network):
     def __init__(
         self,
@@ -140,7 +217,12 @@ class InputGatedMemory(nengo.Network):
 
         self.input = self.input_ns.input
         self.output = self.mem.output
-            
+    
+    
+#######################
+#  Helper functions  #
+########################
+
 def _get_to_SSP_mat(D):
     W = np.fft.ifft(np.eye(D))
     W1 = W.real @ np.fft.ifftshift(np.eye(D),axes=0)
